@@ -1,0 +1,88 @@
+"""
+app.py — Flask microservice.
+
+Endpoints:
+  POST /predict  -> ML-only verdict + confidence
+  POST /analyze  -> ML + GenAI (Gemini) explanation + safety tips
+"""
+import os
+import json
+from flask import Flask, request, jsonify
+import requests
+
+from predict import predict
+
+app = Flask(__name__)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-1.5-flash-latest:generateContent?key=" + GEMINI_API_KEY
+)
+
+
+def gemini_explain(text: str, ml_result: dict):
+    """Ask Gemini to explain the verdict and produce safety tips."""
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = (
+        "You are a cybersecurity analyst. The following message was classified by an "
+        f"ML model as '{ml_result['verdict']}' with confidence {ml_result['confidence']}%.\n\n"
+        f"Message: \"\"\"{text}\"\"\"\n\n"
+        "Reply ONLY in JSON with keys:\n"
+        '  "explanation": 2-4 sentence reasoning,\n'
+        '  "indicators": list of suspicious clues,\n'
+        '  "recommendations": list of 3-5 short safety tips.'
+    )
+
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        r = requests.post(GEMINI_URL, json=body, timeout=20)
+        r.raise_for_status()
+        out = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        # Strip code fences if present
+        out = out.strip().strip("`")
+        if out.startswith("json"):
+            out = out[4:].strip()
+        return json.loads(out)
+    except Exception as e:
+        print("Gemini error:", e)
+        return None
+
+
+@app.post("/predict")
+def predict_endpoint():
+    data = request.get_json(force=True) or {}
+    text = (data.get("input") or "").strip()
+    if not text:
+        return jsonify(error="input is required"), 400
+    return jsonify(predict(text))
+
+
+@app.post("/analyze")
+def analyze_endpoint():
+    data = request.get_json(force=True) or {}
+    text = (data.get("input") or "").strip()
+    if not text:
+        return jsonify(error="input is required"), 400
+
+    ml = predict(text)
+    ai = gemini_explain(text, ml) or {
+        "explanation": "Heuristic-only analysis (no Gemini key configured).",
+        "indicators": [],
+        "recommendations": [
+            "Never share OTPs, passwords or card details.",
+            "Do not click suspicious links.",
+            "Verify with the official source.",
+        ],
+    }
+    return jsonify({**ml, **ai, "category": ai.get("category", "General")})
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=True)
